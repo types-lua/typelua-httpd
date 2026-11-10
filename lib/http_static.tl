@@ -55,15 +55,24 @@ type FileRead = {
   tooLarge: boolean,
 }
 
---- Reads a file with a hard cap. `seek` distinguishes directories (which
---- `io.open` accepts on Linux) from empty regular files, where `read(n)`
---- would report EOF and be mistaken for an I/O error.
+--- Reads a file with a hard cap. The zero-byte probe distinguishes a
+--- readable regular file from a directory: Linux permits `io.open` on a
+--- directory, and directory sizes reported by `seek` are filesystem-specific
+--- (sometimes zero, sometimes larger than the cap).
 local function readCapped(path: string, maxBytes: integer): FileRead
   local file = io.open(path, "rb")
   if file == nil then
     return { data = nil, tooLarge = false }
   end
+  local probe: string | nil = file:read(0)
   local size: number | nil = file:seek("end")
+  if probe == nil then
+    file:close()
+    if size == 0 then
+      return { data = "", tooLarge = false }
+    end
+    return { data = nil, tooLarge = false }
+  end
   if size == nil then
     file:close()
     return { data = nil, tooLarge = false }
@@ -74,15 +83,11 @@ local function readCapped(path: string, maxBytes: integer): FileRead
   end
   file:seek("set", 0)
   -- Read at most cap+1 even if the file grows between seek and read.
-  -- `read(n)` returns nil both for a directory and for an empty regular file;
-  -- the size tells them apart.
   local data: string | nil = file:read(maxBytes + 1)
   file:close()
   if data == nil then
-    if size == 0 then
-      return { data = "", tooLarge = false }
-    end
-    return { data = nil, tooLarge = false }
+    -- A regular file can shrink to empty after the size probe.
+    return { data = "", tooLarge = false }
   end
   if #data > maxBytes then
     return { data = nil, tooLarge = true }
