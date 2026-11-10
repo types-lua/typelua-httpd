@@ -281,8 +281,18 @@ class H2Connection {
         self.peerInitialWindow = setting.value
         for _, stream in pairs(self.streams) do
           if stream ~= nil then
-            stream!.sendWindow = stream!.sendWindow + delta
+            local nextWindow: integer = math.floor(stream!.sendWindow + delta)
+            if nextWindow > 2147483647 then
+              self:connectionError(frameMod.H2_FLOW_CONTROL_ERROR, "stream window overflow")
+              return
+            end
+            stream!.sendWindow = nextWindow
           end
+        end
+      elseif setting.id == 2 then
+        if setting.value > 1 then
+          self:connectionError(frameMod.H2_PROTOCOL_ERROR, "invalid ENABLE_PUSH")
+          return
         end
       elseif setting.id == 5 then
         if setting.value < 16384 or setting.value > 16777215 then
@@ -403,7 +413,7 @@ class H2Connection {
     self.headerStream = frame.streamId
     self.headerBlock = fragment
     self.expectingContinuation = math.floor(frame.flags / 4) % 2 == 0
-    if math.floor(frame.flags / 1) % 2 == 1 then
+    if frame.flags % 2 == 1 then
       stream.endStream = true
     end
     if not self.expectingContinuation then
@@ -648,7 +658,7 @@ class H2Connection {
         )
       end
     end
-    if math.floor(frame.flags / 1) % 2 == 1 then
+    if frame.flags % 2 == 1 then
       current.endStream = true
       self:finishBody(current)
     end
