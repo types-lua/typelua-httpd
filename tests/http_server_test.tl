@@ -405,6 +405,170 @@ return {
     step(g)
   end,
 
+  ["streaming route receives chunks via coroutine"] = function(): void
+    local f = makeFixture({})
+    local seenChunks: integer = 0
+    f.router:stream("POST", "/upload", function(ctx: HttpContextApi): void
+      local total: integer = 0
+      local chunks: integer = 0
+      while true do
+        local chunk: string | nil = ctx:readBody()
+        if chunk == nil then break end
+        total = total + #chunk!
+        chunks = chunks + 1
+      end
+      seenChunks = chunks
+      ctx:set("X-Chunks", tostring(chunks))
+      ctx:send(tostring(total), "text/plain")
+    end)
+    local body: string = string.rep("z", 70000)
+    local wire: string = "POST /upload HTTP/1.1\r\nHost: t\r\nContent-Length: 70000\r\n\r\n"
+      .. body
+    local conn = connect(f, "stream", wire, true)
+    local output: string = ""
+    for _: integer = 1, 8 do
+      step(f)
+      output = output .. conn:takeOutput()
+      if literal.find(output, "HTTP/1.1 200 OK", 1) ~= nil then break end
+    end
+    local res = parseResponses(output, { "POST" })[1]
+    T.eq(res.status, 200, "status")
+    T.eq(res.body, "70000", "streamed total")
+    T.ok(seenChunks > 1, "body arrived in multiple chunks")
+    T.eq(res.headers["x-chunks"], tostring(seenChunks), "chunk count header")
+  end,
+
+  ["streaming chunked request"] = function(): void
+    local f = makeFixture({})
+    f.router:stream("POST", "/c", function(ctx: HttpContextApi): void
+      local out: string[] = {}
+      while true do
+        local chunk: string | nil = ctx:readBody()
+        if chunk == nil then break end
+        out[#out + 1] = chunk!
+      end
+      ctx:text(table.concat(out))
+    end)
+    local wire: string = "POST /c HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n"
+      .. "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n"
+    local conn = connect(f, "chunkstream", wire, true)
+    step(f)
+    local res = parseResponses(conn:takeOutput(), { "POST" })[1]
+    T.eq(res.status, 200, "status")
+    T.eq(res.body, "Wikipedia", "streamed chunked body")
+  end,
+
+  ["streaming handler may return early and closes"] = function(): void
+    local f = makeFixture({})
+    f.router:stream("POST", "/early", function(ctx: HttpContextApi): void
+      ctx:text("early")
+    end)
+    f.router:get("/next", function(ctx: HttpContextApi): void ctx:text("next") end)
+    local wire: string = "POST /early HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\n\r\nhello"
+      .. "GET /next HTTP/1.1\r\nHost: t\r\n\r\n"
+    local conn = connect(f, "early", wire, true)
+    step(f)
+    local responses = parseResponses(conn:takeOutput(), { "POST" })
+    T.eq(#responses, 1, "only the early response")
+    T.eq(responses[1].status, 200, "status")
+    T.eq(responses[1].body, "early", "body")
+    T.eq(responses[1].headers["connection"], "close", "closes without draining")
+  end,
+
+  ["streaming handler errors become 500"] = function(): void
+    local f = makeFixture({})
+    f.router:stream("POST", "/boom", function(ctx: HttpContextApi): void
+      error("stream exploded")
+    end)
+    local conn = connect(
+      f,
+      "streamboom",
+      "POST /boom HTTP/1.1\r\nHost: t\r\nContent-Length: 1\r\n\r\nx",
+      true
+    )
+    step(f)
+    local res = parseResponses(conn:takeOutput(), { "POST" })[1]
+    T.eq(res.status, 500, "status")
+    T.eq(res.body, "Internal Server Error\n", "body")
+    T.eq(res.headers["connection"], "close", "close")
+  end,
+
+  ["streaming keep-alive and pipelining"] = function(): void
+    local f = makeFixture({})
+    local count: integer = 0
+    f.router:stream("POST", "/s", function(ctx: HttpContextApi): void
+      count = count + 1
+      local total: integer = 0
+      while true do
+        local chunk: string | nil = ctx:readBody()
+        if chunk == nil then break end
+        total = total + #chunk!
+      end
+      ctx:text(tostring(count) .. ":" .. tostring(total))
+    end)
+    local wire: string = "POST /s HTTP/1.1\r\nHost: t\r\nContent-Length: 3\r\n\r\nabc"
+      .. "POST /s HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\n\r\nde"
+    local conn = connect(f, "streampipe", wire, true)
+    step(f)
+    local responses = parseResponses(conn:takeOutput(), { "POST", "POST" })
+    T.eq(#responses, 2, "two responses")
+    T.eq(responses[1].body, "1:3", "first")
+    T.eq(responses[2].body, "2:2", "second")
+  end,
+
+  ["streaming route with 100-continue"] = function(): void
+    local f = makeFixture({})
+    f.router:stream("POST", "/upload", function(ctx: HttpContextApi): void
+      local body: string = ""
+      while true do
+        local chunk: string | nil = ctx:readBody()
+        if chunk == nil then break end
+        body = body .. chunk!
+      end
+      ctx:text(body)
+    end)
+    local headersWire: string = "POST /upload HTTP/1.1\r\nHost: t\r\n"
+      .. "Content-Length: 5\r\nExpect: 100-continue\r\n\r\n"
+    local conn = connect(f, "streamexpect", headersWire, false)
+    step(f)
+    local interim = conn:takeOutput()
+    T.ok(string.find(interim, "HTTP/1.1 100 Continue", 1, true) ~= nil, "100")
+    conn:feed("hello")
+    step(f)
+    local res = parseResponses(conn:takeOutput(), { "POST" })[1]
+    T.eq(res.status, 200, "status")
+    T.eq(res.body, "hello", "body")
+    conn:closeInput()
+    step(f)
+  end,
+
+  ["streaming request timeout while waiting for body"] = function(): void
+    local f = makeFixture({ idleTimeout = 10, requestTimeout = 2 })
+    f.router:stream("POST", "/slow", function(ctx: HttpContextApi): void
+      local chunks: string[] = {}
+      while true do
+        local chunk: string | nil = ctx:readBody()
+        if chunk == nil then break end
+        chunks[#chunks + 1] = chunk!
+      end
+      ctx:text("done")
+    end)
+    local conn = connect(
+      f,
+      "streamslow",
+      "POST /slow HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\n\r\nab",
+      false
+    )
+    local transport: any = f.transport
+    step(f)
+    T.eq(conn:takeOutput(), "", "waiting")
+    transport:advance(3)
+    step(f)
+    local res = parseResponses(conn:takeOutput(), { "POST" })[1]
+    T.eq(res.status, 408, "timeout")
+    T.eq(res.headers["connection"], "close", "close")
+  end,
+
   ["invalid server options fail fast"] = function(): void
     T.raises(function(): void
       makeFixture({ serverName = "bad\r\nX-Injected: 1" })

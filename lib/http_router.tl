@@ -15,6 +15,7 @@ type Route = {
   pattern: string,
   segments: Segment[],
   handler: Handler,
+  streaming: boolean,
 }
 
 type Match = {
@@ -97,6 +98,19 @@ class HttpRouter implements HttpRouterApi {
       pattern = pattern,
       segments = compile(pattern),
       handler = handler,
+      streaming = false,
+    }
+  end,
+
+  --- Registers a handler that is dispatched as soon as headers are complete.
+  --- The handler may call ctx:readBody() to pull request chunks.
+  stream(method: string, pattern: string, handler: Handler): void
+    self.routes[#self.routes + 1] = {
+      method = string.upper(method),
+      pattern = pattern,
+      segments = compile(pattern),
+      handler = handler,
+      streaming = true,
     }
   end,
 
@@ -167,6 +181,12 @@ class HttpRouter implements HttpRouterApi {
     return out
   end,
 
+  isStreaming(method: string, path: string): boolean
+    local match: Match = self:find(string.upper(method), path)
+    if match.route == nil then return false end
+    return match.route!.streaming
+  end,
+
   allowedAll(): string[]
     local seen: map<string, boolean> = {}
     local out: string[] = {}
@@ -188,7 +208,28 @@ class HttpRouter implements HttpRouterApi {
   end,
 
   handle(req: HttpRequestApi, res: HttpResponseApi): void
+    self:runHandle(req, res, nil, true)
+  end,
+
+  handleStream(
+    req: HttpRequestApi,
+    res: HttpResponseApi,
+    bodyReader: BodyReader
+  ): void
+    -- Streaming handlers run inside a server-owned coroutine. On Lua 5.1 a
+    -- yield cannot cross pcall, so the server protects coroutine.resume
+    -- instead and this path intentionally lets handler errors propagate.
+    self:runHandle(req, res, bodyReader, false)
+  end,
+
+  runHandle(
+    req: HttpRequestApi,
+    res: HttpResponseApi,
+    bodyReader: BodyReader | nil,
+    protectedMode: boolean
+  ): void
     local ctx = contextMod.HttpContext.new(req, res)
+    if bodyReader ~= nil then ctx:setBodyReader(bodyReader!) end
     local method: string = string.upper(req.method)
     if method == "OPTIONS" and req.path == "*" then
       local all: string[] = self:allowedAll()
@@ -241,6 +282,11 @@ class HttpRouter implements HttpRouterApi {
         continueFrom(stage + 1)
       end
       mw!(ctx, nextOnce)
+    end
+
+    if not protectedMode then
+      continueFrom(1)
+      return
     end
 
     local ok, err = pcall(function(): void continueFrom(1) end)

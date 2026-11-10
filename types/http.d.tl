@@ -45,11 +45,32 @@ declare interface HttpResponseApi {
   status: integer,
   headers: HeadersApi,
   body: string,
+  websocket?: any,
 }
 
 declare type Handler = (ctx: HttpContextApi) -> void
+declare type BodyReader = () -> (string | nil)
 declare type Middleware = (ctx: HttpContextApi, next: () -> void) -> void
 declare type ErrorHandler = (ctx: HttpContextApi, err: any) -> void
+
+declare type WebSocketHandlers = {
+  onOpen?: (ws: any) -> void,
+  onText?: (ws: any, text: string) -> void,
+  onBinary?: (ws: any, data: string) -> void,
+  onClose?: (ws: any, code: integer, reason: string) -> void,
+  protocols?: string[],
+  maxMessageBytes?: integer,
+  maxFrameBytes?: integer,
+}
+
+declare type MultipartRequestOptions = {
+  maxHeaderBytes?: integer,
+  maxHeaders?: integer,
+  maxParts?: integer,
+  maxPartBytes?: integer,
+  maxTotalBytes?: integer,
+  requireDisposition?: boolean,
+}
 
 declare interface HttpContextApi {
   req: HttpRequestApi,
@@ -65,11 +86,17 @@ declare interface HttpContextApi {
   param(name: string): string | nil,
   query(name: string): string | nil,
   cookie(name: string): string | nil,
+  readBody(): string | nil,
+  setBodyReader(reader: BodyReader): void,
+  multipart(options: MultipartRequestOptions): any,
+  websocket(handlers: WebSocketHandlers): void,
 }
 
 declare interface HttpRouterApi {
   use(mw: Middleware): void,
   add(method: string, pattern: string, handler: Handler): void,
+  stream(method: string, pattern: string, handler: Handler): void,
+  isStreaming(method: string, path: string): boolean,
   get(pattern: string, handler: Handler): void,
   post(pattern: string, handler: Handler): void,
   put(pattern: string, handler: Handler): void,
@@ -80,6 +107,7 @@ declare interface HttpRouterApi {
   notFound(handler: Handler): void,
   onError(handler: ErrorHandler): void,
   handle(req: HttpRequestApi, res: HttpResponseApi): void,
+  handleStream(req: HttpRequestApi, res: HttpResponseApi, bodyReader: BodyReader): void,
   count(): integer,
 }
 
@@ -119,9 +147,21 @@ declare type ParseOutcome = {
 declare interface HttpRequestParserApi {
   feed(data: string): void,
   next(): ParseOutcome,
+  nextEvent(): ParseEvent,
+  peekHeaders(): ParseOutcome,
+  takeBuffered(): string,
   reset(): void,
   buffered(): integer,
   requestActive(): boolean,
+}
+
+declare type ParseEvent = {
+  kind: string,
+  request: HttpRequestApi | nil,
+  chunk: string,
+  last: boolean,
+  error: HttpError | nil,
+  expectContinue: boolean,
 }
 
 declare type ParserOptions = {
@@ -172,9 +212,22 @@ declare type TransportAddress = {
   port: integer,
 }
 
+declare type TlsOptions = {
+  certificate: string,
+  key: string,
+  alpn?: string[],
+  protocol?: string,
+  ciphers?: string,
+  password?: string,
+}
+
 declare interface HttpConnectionApi {
   id(): string,
   isReadable(): boolean,
+  needsWrite(): boolean,
+  needsHandshake(): boolean,
+  poll(): boolean,
+  protocol(): string,
   readAvailable(maxBytes: integer): ReadResult,
   writeSome(data: string): WriteResult,
   close(): void,
@@ -219,6 +272,8 @@ declare type ServerOptions = {
   outBufferLimit?: integer,
   serverName?: string,
   keepAlive?: boolean,
+  http2?: boolean,
+  h2c?: boolean,
 }
 
 declare type ServerStats = {

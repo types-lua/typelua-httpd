@@ -7,6 +7,7 @@
 --- Environment:
 ---   HOST (default 127.0.0.1)
 ---   PORT (default 8080, 0 picks a free port)
+---   TLS_CERT / TLS_KEY (optional PEM paths; enables TLS + ALPN h2/http1.1)
 
 import http from "./lib/http"
 
@@ -82,6 +83,7 @@ router:get("/", function(ctx: HttpContextApi): void
       <li><a href="/static/">/static/</a></li>
       <li><a href="/redirect">/redirect</a></li>
     </ul>
+    <p>WebSocket endpoint: <code>ws://HOST:PORT/ws</code></p>
   </body>
 </html>
 ]])
@@ -127,6 +129,51 @@ router:post("/api/echo", function(ctx: HttpContextApi): void
   ctx:send(ctx.req.body, "application/octet-stream")
 end)
 
+--- Streaming upload: the body never lands in req.body.
+router:stream("POST", "/upload", function(ctx: HttpContextApi): void
+  local total: integer = 0
+  local chunks: integer = 0
+  while true do
+    local chunk: string | nil = ctx:readBody()
+    if chunk == nil then break end
+    total = total + #chunk!
+    chunks = chunks + 1
+  end
+  ctx:set("X-Chunks", tostring(chunks))
+  ctx:send("received " .. tostring(total) .. " bytes in " .. tostring(chunks) .. " chunks\n",
+    "text/plain; charset=utf-8")
+end)
+
+--- Multipart upload. Works for buffered and streaming routes.
+router:post("/form", function(ctx: HttpContextApi): void
+  local reader = ctx:multipart({ maxPartBytes = 2 * 1024 * 1024 })
+  local summary: string[] = {}
+  while true do
+    local part = reader:nextPart()
+    if part == nil then break end
+    local meta = part:meta()
+    local value: string = part:readAll()
+    local label: string = meta.name
+    if meta.filename ~= nil then label = label .. "[" .. meta.filename! .. "]" end
+    summary[#summary + 1] = label .. "=" .. tostring(#value) .. " bytes"
+  end
+  ctx:send(table.concat(summary, "\n") .. "\n", "text/plain; charset=utf-8")
+end)
+
+router:get("/ws", function(ctx: HttpContextApi): void
+  ctx:websocket({
+    onOpen = function(socket: any): void
+      socket:sendText("welcome to typelua-httpd websocket")
+    end,
+    onText = function(socket: any, text: string): void
+      socket:sendText("echo: " .. text)
+    end,
+    onBinary = function(socket: any, data: string): void
+      socket:sendBinary(data)
+    end,
+  })
+end)
+
 router:get("/redirect", function(ctx: HttpContextApi): void
   ctx:redirect("/", 302)
 end)
@@ -149,7 +196,18 @@ router:onError(function(ctx: HttpContextApi, err: any): void
   ctx:text("Internal Server Error\n", 500)
 end)
 
-local server = http.HttpServer.new(router, http.SocketTransport.new(), {
+local certificate: string = env("TLS_CERT", "")
+local key: string = env("TLS_KEY", "")
+local transport: HttpTransportApi
+local scheme: string = "http"
+if certificate ~= "" and key ~= "" then
+  transport = http.TlsTransport.new({ certificate = certificate, key = key })
+  scheme = "https"
+else
+  transport = http.SocketTransport.new()
+end
+
+local server = http.HttpServer.new(router, transport, {
   serverName = "typelua-httpd-demo",
   maxBody = 2 * 1024 * 1024,
   maxConnections = 256,
@@ -159,6 +217,6 @@ local server = http.HttpServer.new(router, http.SocketTransport.new(), {
 
 server:listen(env("HOST", "127.0.0.1"), portFromEnv())
 local address = server:address()
-print("typelua-httpd listening on http://" .. address.host .. ":" .. tostring(address.port))
+print("typelua-httpd listening on " .. scheme .. "://" .. address.host .. ":" .. tostring(address.port))
 print("Press Ctrl+C to stop.")
 server:serve()

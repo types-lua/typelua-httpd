@@ -39,6 +39,22 @@ class SocketConnection implements HttpConnectionApi {
     return true
   end,
 
+  needsWrite(): boolean
+    return false
+  end,
+
+  needsHandshake(): boolean
+    return false
+  end,
+
+  poll(): boolean
+    return false
+  end,
+
+  protocol(): string
+    return ""
+  end,
+
   readAvailable(maxBytes: integer): ReadResult
     local data, err, partial = self.sock:receive(maxBytes)
     if data ~= nil then

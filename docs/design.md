@@ -2,238 +2,241 @@
 
 ## Goals
 
-1. A complete HTTP/1.1 request/response core that can be used as a library.
-2. Strict framing and bounded resource use; no request is dispatched before its body is
-   complete.
-3. Deterministic tests for every state transition, plus a real TCP adapter.
-4. TypeLua source that erases to portable Lua 5.4 and Lua 5.1/LuaJIT.
+1. One router-serving library for HTTP/1.1, HTTP/2, TLS and WebSocket.
+2. Strict framing, bounded memory and no dispatch before the protocol state is
+   valid.
+3. Streaming request bodies without sacrificing Lua 5.1/LuaJIT compatibility.
+4. Deterministic tests for protocol logic, plus real TCP/TLS interoperability.
+5. TypeLua source that erases to portable Lua 5.4 and Lua 5.1/LuaJIT.
 
-Non-goals: TLS, HTTP/2, streaming bodies, multipart, WebSocket upgrades, proxy behaviour
-and directory listings.
+Non-goals: HTTP/3, server push, HTTP/2 priority scheduling, RFC 8441 WebSocket,
+mTLS termination, compression and streaming responses.
 
 ## Layers
 
 ```
-                 application
-        ┌───────────────────────────┐
-        │ router / handlers / static│
-        ├───────────────────────────┤
-        │ HttpContext / HttpRequest │
-        │ HttpResponse / Headers    │
-        ├───────────────────────────┤
-        │ HttpServer state machine  │
-        │ parser · timeouts · queues│
-        ├───────────────────────────┤
-        │ HttpTransportApi          │
-        │  ┌───────────┐ ┌────────┐ │
-        │  │ memory    │ │ socket │ │
-        │  └───────────┘ └────────┘ │
-        └───────────────────────────┘
+                       application
+          ┌──────────────────────────────────┐
+          │ router · middleware · handlers   │
+          │ static · WebSocket · multipart   │
+          ├──────────────────────────────────┤
+          │ HttpContext / Request / Response │
+          ├──────────────────────────────────┤
+          │ HttpServer protocol dispatcher   │
+          │  sniff → H1 | H2 | WS            │
+          ├──────────────┬───────────────────┤
+          │ HTTP/1.1     │ HTTP/2            │
+          │ parser/state │ frames/HPACK/flow │
+          ├──────────────┴───────────────────┤
+          │ HttpTransportApi                 │
+          │ memory · LuaSocket · LuaSec TLS  │
+          └──────────────────────────────────┘
 ```
 
-`HttpServer` never sees sockets. It sees `HttpConnectionApi` values that expose
-non-blocking `readAvailable`, `writeSome`, `close` and `remoteAddress`. A selector reports
-which connections are readable/writable. The memory transport returns immediately and
-uses a manual clock, which is why timeout tests are deterministic.
+`HttpServer` never sees sockets. It sees `HttpConnectionApi` values exposing
+non-blocking `readAvailable`, `writeSome`, `close`, ALPN protocol, handshake and
+polling hints. The memory transport returns immediately and uses a manual clock,
+so timeout tests are deterministic.
 
-## Request lifecycle
+## Connection lifecycle
 
 ```
-accept → parser.feed → parser.next
-                         │
-          ┌──────────────┼────────────────┐
-          │              │                │
-       needMore       expectContinue     error
-          │              │                │
-       wait for       send 100,          400/408/413/
-       readable       parse again       414/417/431/505
-                         │
-                      request
-                         │
-                 router.handle(req,res)
-                         │
-                 serialize(res, opts)
-                         │
-                 append output queue
-                         │
-                 flush while writable
-                         │
-                 keep-alive? ──no──→ close
-                         │yes
-                 parse buffered pipeline
+accept
+  │
+  ├─ TLS handshake (non-blocking wantread/wantwrite)
+  │      └─ ALPN result: h2 or http/1.1
+  │
+  ├─ protocol sniff
+  │    ├─ h2c preface  → HTTP/2 connection
+  │    ├─ h2 ALPN     → HTTP/2 connection
+  │    └─ anything else → HTTP/1.1 parser
+  │
+  ├─ HTTP/1.1 request ──→ headers complete
+  │                         ├─ normal route: buffer body → handler
+  │                         └─ stream route: coroutine + body chunks
+  │
+  ├─ HTTP/2 stream ────→ headers decoded
+  │                         ├─ normal route: buffer DATA → handler
+  │                         └─ stream route: coroutine + DATA chunks
+  │
+  └─ HTTP/1.1 101 upgrade → WebSocket frame loop
 ```
 
-A connection owns exactly one parser. After a complete request the parser resets in place
-and immediately consumes any buffered pipeline, so one readable event can produce several
-responses.
+A connection has one mode: `SNIFF`, `H1`, `H2` or `WS`. Mode transitions happen
+before any application bytes are misparsed. HTTP/2 and WebSocket connections skip
+the HTTP/1.1 phase state machine entirely.
 
-## Parser invariants
+### Protocol sniffing
 
-The parser is a byte-string state machine with states:
+The h2c preface is the 24-byte `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n` string. The
+server buffers only while the bytes remain a prefix of that preface; the first
+mismatch commits to HTTP/1.1. TLS ALPN is authoritative and does not wait for a
+preface. A one-byte partial preface is still an active request for timeout
+purposes, so slow preface clients cannot hold connections indefinitely.
+
+## HTTP/1.1 parser invariants
+
+States:
 
 ```
 LINE → HEADERS → BODY ────────────────┐
                     │                 │
-                    └→ CHUNK_SIZE ← CHUNK_DATA
+                    └→ CHUNK_SIZE ← CHUNK_DATA → CHUNK_CRLF
                            │
-                           └→ TRAILERS → complete
+                           └→ TRAILERS → END
 ```
 
-Hard invariants:
+Invariants:
 
-- CRLF is mandatory; a bare LF is a `400`.
-- Header folding is rejected; header names are RFC tokens; values reject C0 controls
+- CRLF is mandatory; a bare LF is `400`.
+- Obs-fold is rejected; header names are RFC tokens; values reject C0 controls
   other than HTAB, plus DEL.
 - At most one `Host`; HTTP/1.1 requires it.
-- `Transfer-Encoding` and `Content-Length` cannot coexist. Duplicate `Content-Length`
-  is accepted only when all values are identical decimal strings.
-- Only `Transfer-Encoding: chunked` is supported. Chunk sizes are hex, capped by
-  `maxChunkLine`; the accumulated body is capped by `maxBody`; chunk count is capped by
-  `maxChunks`.
-- A request is returned only after its entire body and trailers have arrived.
-- `expectContinue` is emitted at most once, and only for HTTP/1.1 with a body.
-- Limits are checked while reading, not after unbounded buffering.
-- The parser never decodes or normalizes the request target beyond splitting
-  path/query; routers and static serving decode explicitly and exactly once.
+- `Transfer-Encoding` and `Content-Length` cannot coexist; duplicate lengths only
+  when identical decimal strings.
+- Only `Transfer-Encoding: chunked` is accepted.
+- Limits are enforced while reading, never after unbounded buffering.
+- A buffered request returns only after the complete body/trailers.
+- `expectContinue` is emitted once, only for HTTP/1.1 with a body.
+- `requestActive()` remains true after complete header lines are consumed while
+  waiting for the terminating CRLF; `buffered()` alone is insufficient.
+- `takeBuffered()` hands remaining bytes to a WebSocket session after upgrade.
 
-`requestActive()` distinguishes "idle keep-alive connection" from "a request was started
-but the final CRLF/body has not arrived". This matters because `buffered()` is zero after
-the parser has consumed complete header lines while waiting for the blank line.
+### Buffered vs streaming events
 
-## Server state
+`nextEvent()` emits `headers`, `body` chunks, `end` (or `continue`/`error`/
+`needMore`). `peekHeaders()` stops at the end of headers. A normal route then
+calls `next()` to concatenate the body; a stream route consumes `nextEvent()`
+chunks. Both share the same framing code and tests.
 
-Per connection:
+Streaming handler dispatch runs the handler in a coroutine. `ctx:readBody()`
+yields until the server pushes a chunk. On Lua 5.1/LuaJIT, yielding through
+`pcall` is illegal, so the router's streaming path is intentionally unprotected
+and the server wraps `coroutine.resume` with `pcall` instead. A handler error
+becomes a clean 500; `router.onError` is only invoked for buffered handlers.
 
-```tl
-type ConnState = {
-  conn, parser, out, outPos,
-  closing, inputClosed,
-  requests, lastActive, continueSent,
-}
+## HTTP/2
+
+### Frames
+
+`http_h2_frame.tl` parses the 9-byte header and payload incrementally with a
+16 KiB advertised maximum frame size. Frame semantics are checked by the
+connection:
+
+- SETTINGS: stream 0, ACK length 0, known values validated, ACK sent.
+- PING: stream 0, 8 bytes, ACK echoed.
+- WINDOW_UPDATE: 4-byte increments, zero is a protocol error, overflow checked.
+- RST_STREAM/PRIORITY/GOAWAY lengths and stream ids validated.
+- PUSH_PROMISE from a client is a connection error.
+- HEADERS/CONTINUATION ordering enforced; no other frame may interleave.
+- DATA padding, END_STREAM and stream existence validated.
+
+### HPACK
+
+The decoder owns a dynamic table per connection:
+
+- Static table indexes 1–61.
+- Integer/string decoding with prefix limits and overflow checks.
+- Huffman tree generated from the RFC 7541 Appendix B code table; padding must
+  be at most 7 bits and all ones; EOS is rejected.
+- Dynamic table insertions/evictions, table-size updates only before fields and
+  never above the advertised 4096 bytes.
+- 64 KiB and 200-header decoded limits.
+
+The encoder is stateless: exact static matches use indexed fields, otherwise
+literal-without-indexing with a static name index when possible. The curl/nghttp2
+interoperability tests exercise Huffman request blocks and dynamic tables.
+
+### Streams and flow control
+
+- Client stream ids are odd and increasing; 100 concurrent streams advertised.
+- Connection and per-stream send windows start at 65535 and shrink on DATA.
+- Response headers are fragmented into HEADERS/CONTINUATION at peer
+  `MAX_FRAME_SIZE`; DATA waits for WINDOW_UPDATE when windows are exhausted.
+- Received DATA immediately replenishes connection and stream windows, while
+  `maxBody` caps how much request payload can be retained.
+- Buffered routes wait for END_STREAM; streaming routes dispatch at END_HEADERS.
+- Early streaming responses send RST_STREAM(CANCEL) for the unfinished request.
+- Compressed header blocks are capped at 64 KiB before HPACK decoding.
+
+## TLS
+
+LuaSec wraps accepted sockets with a non-blocking SSL object:
+
+- `dohandshake()` returns `wantread`/`wantwrite`; the connection records write
+  interest and the server's selector/flush path drives it.
+- ALPN is negotiated from the ordered list (default `h2`, `http/1.1`);
+  `getalpn()` selects the HTTP/2 path.
+- TLS sockets are polled on short steps because LuaSec may hold decrypted bytes
+  that `select()` cannot see on the raw fd. Reads drain decrypted records until
+  timeout, capped at 1 MiB per event.
+- Writes support short writes/`wantwrite`; the common output queue handles the
+  rest.
+- Certificate/key files are checked at construction. There is no client cert
+  verification, OCSP or SNI certificate switching.
+
+## WebSocket
+
+- Opening handshake validates GET, HTTP/1.1, `Connection: Upgrade`,
+  `Upgrade: websocket`, version 13 and a base64 16-byte key.
+- `Sec-WebSocket-Accept` is `base64(SHA-1(key + GUID))`.
+- The response is serialized manually so `Connection: Upgrade` survives (the
+  normal serializer would replace it).
+- After 101, parser leftovers are fed to the frame decoder and the connection
+  switches to `WS` mode.
+- Frames: masked client data required, no RSV bits, control frames ≤125 bytes
+  and never fragmented, 7/16/64-bit lengths, 1 MiB frame cap.
+- Messages: text/binary, fragmentation, interleaved ping/pong, close handshake,
+  UTF-8 validation, 4 MiB message cap, 1002/1007/1009 close codes.
+- Idle timeouts are suspended while a WebSocket is open. Heartbeat scheduling is
+  application-level.
+
+## Multipart
+
+The parser is incremental:
+
+```
+--boundary CRLF
+headers CRLF CRLF
+body
+CRLF--boundary CRLF     (next part)
+CRLF--boundary--        (done)
 ```
 
-- `out` is an append queue; `outPos` tracks bytes already written. `flush` supports
-  partial writes and `wouldBlock`.
-- A connection with queued output is registered as writable and also readable (unless
-  closing), so pipelined input can arrive while a slow client drains responses.
-- `outBufferLimit` bounds queued bytes; exceeding it closes the connection rather than
-  growing memory without bound.
-- `maxConnections` is checked at accept time. Refused connections get one `503` write
-  attempt and are closed without entering the state map.
-- `maxRequestsPerConnection` forces `Connection: close` on the last allowed response.
-- A client may half-close after sending pipelined requests. The server keeps parsing
-  buffered complete requests and answers all of them, then closes after the output
-  drains.
-- `idleTimeout` applies only when no request is active. `requestTimeout` applies while
-  `requestActive()` is true and queues a `408`, including after the request line and all
-  complete headers have arrived but the terminating CRLF is missing.
-- A FIN with an incomplete request queues `400 Incomplete Request` and closes.
+- Boundary may be quoted in `Content-Type`.
+- The body scanner retains `#("\r\n--" + boundary) - 1` tail bytes so a boundary
+  split across network reads cannot be emitted as data.
+- `partData` is released as soon as it is unambiguous; parts are never fully
+  buffered by the parser.
+- Limits: header bytes/count, part count, per-part bytes, total bytes.
+- `MultipartReader` adapts a chunk source (string or `ctx:readBody`) into
+  `nextPart()`/`part:read()`; `readAll()` is a convenience.
 
-## Response invariants
+## Resource bounds
 
-The serializer is the last line of defence:
+Defaults are listed in the README. The important invariants are:
 
-- Status must be 100–599.
-- Version must be `1.0` or `1.1`; request method must be a header token.
-- `Content-Length` is always derived from the body. Application values are overwritten.
-- `Transfer-Encoding` is always removed; this library never chunks responses.
-- `HEAD`, 1xx, 204, 205 and 304 never carry a body.
-- 205 explicitly sends `Content-Length: 0`.
-- `Date` and `Server` are filled only if the application did not set them.
-- `Connection` is `close` when the connection will close; HTTP/1.0 keep-alive is
-  explicit; HTTP/1.1 keep-alive is implicit.
-- Header names/values are validated at insertion time, so CRLF injection fails before
-  serialization.
-
-## Router semantics
-
-- Routes are matched in registration order, first match wins.
-- Patterns are `/`-separated; `:name` captures one decoded segment, `*` captures all
-  remaining segments (including none) under key `"*"`.
-- Empty and duplicate slashes collapse because segments are extracted with `[^/]+`.
-- Static pattern segments are percent-decoded; request segments are decoded once.
-- `HEAD` first looks for an explicit HEAD route, then falls back to GET.
-- If no route matches but another method does, the result is `405` with `Allow`.
-- `OPTIONS` without an explicit route returns `204` and `Allow`; `OPTIONS *` returns the
-  union of registered methods.
-- Handler and middleware exceptions are caught. The default is a plain `500`; an
-  `onError` callback can inspect the error and rewrite the response. If that callback
-  throws, the clean default is restored.
-- Middleware is `(ctx, next) -> void`. Calling `next` more than once is not meaningful;
-  a middleware that wants to stop simply returns without calling it.
-
-## Static file security model
-
-`HttpStatic` is intentionally lexical:
-
-1. Strip the mount prefix and reject paths outside it.
-2. Reject encoded slashes (`%2F`), which would otherwise mean one thing to the router
-   and another to the filesystem.
-3. Percent-decode exactly once.
-4. Reject any segment starting with `.` unless `dotfiles = true`.
-5. Normalize `.`/`..` lexically with a stack; `..` that would pop above the root is
-   rejected. NUL and backslash are rejected.
-6. Join the resulting relative path onto the configured root and open it.
-
-Because decoding happens once, `%252e%252e` remains the literal name `%2e%2e` and cannot
-become `..` later. The root itself is trusted configuration; symlinks inside it are not
-followed with an additional containment check, so do not expose an attacker-writable
-tree.
-
-Files are probed with `read(0)` before trusting `seek("end")`; directory sizes are
-filesystem-specific (some report zero, some report more than the cap), while `io.open`
-accepts directories on Linux. A zero-byte regular file is still served as empty. The size
-probe enforces `maxBytes` before reading, and the read is capped at `maxBytes + 1` to
-catch files that grow between the probe and the read. Content is buffered whole. ETags
-are two independent 31-bit rolling hashes (62 bits of tag). Conditional requests use weak
-comparison; `If-Range` requires the exact strong tag.
-
-Only a single byte range is implemented. Multiple or malformed ranges are ignored and
-the full representation is sent, which RFC 7233 permits. An unsatisfiable range sends
-`416` with `Content-Range: bytes */<size>`.
-
-## Transport contract
-
-`readAvailable(maxBytes)` returns:
-
-```tl
-{ data, err, closed, wouldBlock }
-```
-
-- `data` may contain bytes even when `closed` or `wouldBlock` is true.
-- `closed` is a FIN; parse whatever was returned first.
-- `wouldBlock` means no more bytes are available *now*.
-
-`writeSome(data)` returns `written`, `err`, `wouldBlock`. A short positive write is
-normal; the server advances `outPos` and retries on the next writable event. `0` written
-without an error is treated as backpressure to avoid a busy loop.
-
-`select(readers, writers, timeout)` may return a subset. The memory selector reports all
-readable/writable candidates immediately; the LuaSocket selector delegates to
-`socket.select`.
-
-## Compatibility
-
-- No `table.pack`, `table.unpack`, `//`, bitwise operators, `<const>` or `<close>` in the
-  runtime path, so emitted code runs on Lua 5.4 and LuaJIT/5.1.
-- `string.find(..., plain=true)` with `init > 1` is avoided entirely; literal searching
-  goes through `lib/http_literal.tl`, which escapes magic characters and uses pattern
-  search. This works around a bug in the embedded golua runtime.
-- LuaSocket is loaded lazily with `pcall(require, "socket")`. Constructing
-  `SocketTransport` without it raises a clear error; the memory transport still works.
+- Every network input has a byte/count limit enforced incrementally.
+- Response queues have a per-connection cap (`outBufferLimit`); exceeding it
+  closes the connection.
+- HTTP/2 compressed and decoded header blocks are independently capped.
+- WebSocket frame and message sizes are capped before assembly.
+- Multipart limits apply before part data is exposed to handlers.
+- TLS plaintext drains are capped per readable event.
 
 ## Test strategy
 
-- Unit tests for headers, URL/path helpers, status/date/MIME, parser and serializer.
-- Router tests for params, wildcards, ordering, middleware, 404/405/OPTIONS, HEAD,
-  explicit/intercepted errors.
-- Static tests build a real temporary tree and cover traversal variants, dotfiles,
-  empty files, indexes, MIME, caps, ETags, weak/list/star matches, ranges, `If-Range`,
-  HEAD and mounting.
-- Server tests use the memory transport and manual clock to cover keep-alive,
-  pipelining, half-close, chunked requests, 100-continue (both waiting and
-  body-already-buffered), malformed framing, body limits, 503 admission control,
-  idle/request timeouts and response tampering.
-- Real-socket tests bind `127.0.0.1:0`, drive `server:step` from the test loop, and use a
-  non-blocking LuaSocket client for GET, POST, chunked bodies and pipelining. They skip
-  automatically when LuaSocket is unavailable (for example in embedded golua).
+- Crypto vectors (Base64/SHA-1), HPACK RFC vectors, frame round-trips.
+- HTTP/2 connection tests with a raw frame client: GET/POST, CONTINUATION,
+  PING, SETTINGS ACK, flow control, streaming multipart, early streaming
+  response/RST and protocol errors.
+- HTTP/1.1 parser and event parser: fixed/chunked, byte-by-byte, every split
+  point, pipelining, limits and error stickiness.
+- Server integration over memory: keep-alive, pipelining, 100-continue,
+  timeouts, backpressure, 503 admission, streaming and early close.
+- Static files: traversal variants, dotfiles, MIME, ETags, ranges, caps.
+- Multipart: boundary splits at every byte, binary payloads, filename*, limits.
+- Real TCP/TLS: LuaSocket/LuaSec clients, ALPN h1/h2, HTTP/2 GET/POST/streaming,
+  WebSocket echo and streaming uploads.
+- External curl/nghttp2 checks are used during development for h2c, TLS ALPN,
+  large headers and 50 KB streaming uploads.

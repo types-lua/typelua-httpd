@@ -17,6 +17,17 @@ local STATE_CHUNK_SIZE: integer = 4
 local STATE_CHUNK_DATA: integer = 5
 local STATE_TRAILERS: integer = 6
 local STATE_ERROR: integer = 7
+local STATE_CHUNK_CRLF: integer = 8
+local STATE_END: integer = 9
+
+type ParseEvent = {
+  kind: string,
+  request: HttpRequestApi | nil,
+  chunk: string,
+  last: boolean,
+  error: HttpError | nil,
+  expectContinue: boolean,
+}
 
 type LineRead = {
   line: string | nil,
@@ -127,6 +138,7 @@ class HttpRequestParser implements HttpRequestParserApi {
   headerCount: integer = 0,
   expectContinue: boolean = false,
   continueNotified: boolean = false,
+  currentRequest: HttpRequestApi | nil = nil,
 
   constructor(options: ParserOptions)
     self.opts = defaultOptions(options)
@@ -160,6 +172,18 @@ class HttpRequestParser implements HttpRequestParserApi {
     return true
   end,
 
+  --- Removes and returns unparsed bytes. Used when a connection switches
+  --- protocols after a complete HTTP/1.1 upgrade request.
+  takeBuffered(): string
+    local rest: string = ""
+    if self.pos <= #self.buf then
+      rest = string.sub(self.buf, self.pos)
+    end
+    self.buf = ""
+    self.pos = 1
+    return rest
+  end,
+
   reset(): void
     self.buf = ""
     self.pos = 1
@@ -182,6 +206,7 @@ class HttpRequestParser implements HttpRequestParserApi {
     self.headerCount = 0
     self.expectContinue = false
     self.continueNotified = false
+    self.currentRequest = nil
   end,
 
   fail(status: integer, message: string): ParseOutcome
@@ -441,6 +466,358 @@ class HttpRequestParser implements HttpRequestParserApi {
     end
   end,
 
+  event(
+    kind: string,
+    request: HttpRequestApi | nil,
+    chunk: string,
+    last: boolean,
+    err: HttpError | nil
+  ): ParseEvent
+    return {
+      kind = kind,
+      request = request,
+      chunk = chunk,
+      last = last,
+      error = err,
+      expectContinue = false,
+    }
+  end,
+
+  needMoreEvent(): ParseEvent
+    return {
+      kind = "needMore",
+      request = nil,
+      chunk = "",
+      last = false,
+      error = nil,
+      expectContinue = false,
+    }
+  end,
+
+  failEvent(status: integer, message: string): ParseEvent
+    local e: HttpError = { status = status, message = message }
+    self.lastError = e
+    self.state = STATE_ERROR
+    return {
+      kind = "error",
+      request = nil,
+      chunk = "",
+      last = false,
+      error = e,
+      expectContinue = false,
+    }
+  end,
+
+  makeCurrentRequest(): HttpRequestApi
+    local request = requestMod.HttpRequest.new(
+      self.method,
+      self.target,
+      self.path,
+      self.rawQuery,
+      self.query,
+      self.version,
+      self.headers,
+      self:keepAlive()
+    )
+    self.currentRequest = request
+    return request
+  end,
+
+  --- Event-oriented sibling of next(). A normal request yields `headers`,
+  --- zero or more `body` chunks, then `end`. The body is never accumulated in
+  --- the parser, which is what makes bounded streaming possible.
+  nextEvent(): ParseEvent
+    if self.state == STATE_ERROR then
+      local cached: HttpError | nil = self.lastError
+      if cached == nil then
+        local fallback: HttpError = { status = 400, message = "parse error" }
+        return self:event("error", nil, "", false, fallback)
+      end
+      return self:event("error", nil, "", false, cached!)
+    end
+
+    while true do
+      if self.currentRequest == nil and self.state ~= STATE_LINE
+        and self.state ~= STATE_HEADERS and self.state ~= STATE_ERROR then
+        local request: HttpRequestApi = self:makeCurrentRequest()
+        return self:event("headers", request, "", false, nil)
+      end
+      if self.state == STATE_LINE then
+        local read: LineRead = self:readLine(self.opts.maxRequestLine!, 414)
+        if read.needMore then
+          self:trimBuffer()
+          return self:needMoreEvent()
+        end
+        if read.err ~= nil then
+          return self:failEvent(read.err!.status, read.err!.message)
+        end
+        local line: string = read.line!
+        if line == "" then
+          return self:failEvent(400, "empty request line")
+        end
+        local method, target, versionText = string.match(line, "^(%S+) (%S+) (HTTP/%d%.%d)$")
+        if method == nil or target == nil or versionText == nil then
+          return self:failEvent(400, "malformed request line")
+        end
+        local methodText: string = method!
+        local targetText: string = target!
+        local versionRaw: string = versionText!
+        if not headersMod.validName(methodText) then
+          return self:failEvent(400, "invalid method token")
+        end
+        local version: string = string.sub(versionRaw, 6)
+        if version ~= "1.0" and version ~= "1.1" then
+          return self:failEvent(505, "unsupported HTTP version")
+        end
+        if literal.contains(targetText, "#") then
+          return self:failEvent(400, "fragment in request target")
+        end
+        for i: integer = 1, #targetText do
+          local c: integer = string.byte(targetText, i)!
+          if c < 32 or c == 127 then
+            return self:failEvent(400, "control character in request target")
+          end
+        end
+        if targetText == "*" and methodText ~= "OPTIONS" then
+          return self:failEvent(400, "asterisk target is only valid for OPTIONS")
+        end
+        local parts = url.splitTarget(targetText)
+        self.method = methodText
+        self.target = targetText
+        self.path = parts.path
+        self.rawQuery = parts.rawQuery
+        self.query = url.parseQuery(parts.rawQuery)
+        self.version = version
+        self.headers = headersMod.Headers.new()
+        self.headerBytes = 0
+        self.headerCount = 0
+        self.bodyParts = {}
+        self.bodySize = 0
+        self.contentLength = 0
+        self.chunked = false
+        self.chunkRemaining = 0
+        self.chunks = 0
+        self.continueNotified = false
+        self.expectContinue = false
+        self.currentRequest = nil
+        self.state = STATE_HEADERS
+      elseif self.state == STATE_HEADERS then
+        local read: LineRead = self:readLine(self.opts.maxHeaderBytes!, 431)
+        if read.needMore then
+          self:trimBuffer()
+          return self:needMoreEvent()
+        end
+        if read.err ~= nil then
+          return self:failEvent(read.err!.status, read.err!.message)
+        end
+        local line: string = read.line!
+        if line == "" then
+          local outcome: ParseOutcome | nil = self:finishHeaders()
+          if outcome ~= nil then
+            if outcome!.error ~= nil then
+              return self:event("error", nil, "", false, outcome!.error)
+            end
+            if outcome!.expectContinue then
+              return {
+                kind = "continue",
+                request = nil,
+                chunk = "",
+                last = false,
+                error = nil,
+                expectContinue = true,
+              }
+            end
+          end
+          local request: HttpRequestApi = self:makeCurrentRequest()
+          return self:event("headers", request, "", false, nil)
+        else
+          self.headerBytes = self.headerBytes + #line + 2
+          if self.headerBytes > self.opts.maxHeaderBytes! then
+            return self:failEvent(431, "request headers too large")
+          end
+          if string.sub(line, 1, 1) == " " or string.sub(line, 1, 1) == "\t" then
+            return self:failEvent(400, "obsolete header folding is not allowed")
+          end
+          local colon: integer | nil = literal.find(line, ":", 1)
+          if colon == nil then
+            return self:failEvent(400, "malformed header line")
+          end
+          local at: integer = colon!
+          local name: string = string.sub(line, 1, at - 1)
+          local value: string = trimOws(string.sub(line, at + 1))
+          if not headersMod.validName(name) then
+            return self:failEvent(400, "invalid header name")
+          end
+          if not headersMod.validValue(value) then
+            return self:failEvent(400, "invalid header value")
+          end
+          self.headerCount = self.headerCount + 1
+          if self.headerCount > self.opts.maxHeaders! then
+            return self:failEvent(431, "too many headers")
+          end
+          self.headers:add(name, value)
+        end
+      elseif self.state == STATE_BODY then
+        local remaining: integer = self.contentLength - self.bodySize
+        if remaining <= 0 then
+          self.state = STATE_END
+        else
+          if self:buffered() == 0 then
+            self:trimBuffer()
+            return self:needMoreEvent()
+          end
+          local take: integer = self:buffered()
+          if take > remaining then take = remaining end
+          local chunk: string = string.sub(self.buf, self.pos, self.pos + take - 1)
+          self.pos = self.pos + take
+          self.bodySize = self.bodySize + take
+          local last: boolean = self.bodySize >= self.contentLength
+          if last then self.state = STATE_END end
+          if self.pos > 65536 then self:trimBuffer() end
+          return self:event("body", self.currentRequest, chunk, last, nil)
+        end
+      elseif self.state == STATE_CHUNK_SIZE then
+        local read: LineRead = self:readLine(self.opts.maxChunkLine!, 400)
+        if read.needMore then
+          self:trimBuffer()
+          return self:needMoreEvent()
+        end
+        if read.err ~= nil then
+          return self:failEvent(read.err!.status, read.err!.message)
+        end
+        local line: string = read.line!
+        local semi: integer | nil = literal.find(line, ";", 1)
+        local sizeText: string = line
+        if semi ~= nil then
+          sizeText = string.sub(line, 1, semi! - 1)
+        end
+        local size: integer | nil = parseHex(sizeText)
+        if size == nil then
+          return self:failEvent(400, "invalid chunk size")
+        end
+        self.chunks = self.chunks + 1
+        if self.chunks > self.opts.maxChunks! then
+          return self:failEvent(400, "too many chunks")
+        end
+        if self.bodySize + size! > self.opts.maxBody! then
+          return self:failEvent(413, "request body too large")
+        end
+        if size! == 0 then
+          self.state = STATE_TRAILERS
+          self.headerBytes = 0
+          self.headerCount = 0
+        else
+          self.chunkRemaining = size!
+          self.state = STATE_CHUNK_DATA
+        end
+      elseif self.state == STATE_CHUNK_DATA then
+        if self.chunkRemaining == 0 then
+          self.state = STATE_CHUNK_CRLF
+        else
+          if self:buffered() == 0 then
+            self:trimBuffer()
+            return self:needMoreEvent()
+          end
+          local take: integer = self:buffered()
+          if take > self.chunkRemaining then take = self.chunkRemaining end
+          local chunk: string = string.sub(self.buf, self.pos, self.pos + take - 1)
+          self.pos = self.pos + take
+          self.chunkRemaining = self.chunkRemaining - take
+          self.bodySize = self.bodySize + take
+          if self.pos > 65536 then self:trimBuffer() end
+          return self:event("body", self.currentRequest, chunk, false, nil)
+        end
+      elseif self.state == STATE_CHUNK_CRLF then
+        if self:buffered() < 2 then
+          self:trimBuffer()
+          return self:needMoreEvent()
+        end
+        if string.sub(self.buf, self.pos, self.pos + 1) ~= "\r\n" then
+          return self:failEvent(400, "missing CRLF after chunk data")
+        end
+        self.pos = self.pos + 2
+        self.state = STATE_CHUNK_SIZE
+      elseif self.state == STATE_TRAILERS then
+        local read: LineRead = self:readLine(self.opts.maxHeaderBytes!, 431)
+        if read.needMore then
+          self:trimBuffer()
+          return self:needMoreEvent()
+        end
+        if read.err ~= nil then
+          return self:failEvent(read.err!.status, read.err!.message)
+        end
+        local line: string = read.line!
+        if line == "" then
+          self.state = STATE_END
+        else
+          self.headerBytes = self.headerBytes + #line + 2
+          if self.headerBytes > self.opts.maxHeaderBytes! then
+            return self:failEvent(431, "trailers too large")
+          end
+          if string.sub(line, 1, 1) == " " or string.sub(line, 1, 1) == "\t" then
+            return self:failEvent(400, "obsolete trailer folding is not allowed")
+          end
+          local colon: integer | nil = literal.find(line, ":", 1)
+          if colon == nil then
+            return self:failEvent(400, "malformed trailer")
+          end
+          local name: string = string.sub(line, 1, colon! - 1)
+          local value: string = trimOws(string.sub(line, colon! + 1))
+          if not headersMod.validName(name) or not headersMod.validValue(value) then
+            return self:failEvent(400, "invalid trailer")
+          end
+        end
+      elseif self.state == STATE_END then
+        local request: HttpRequestApi | nil = self.currentRequest
+        if request == nil then
+          return self:failEvent(500, "parser lost the request")
+        end
+        self:trimBuffer()
+        self.state = STATE_LINE
+        self.headers = headersMod.Headers.new()
+        self.bodyParts = {}
+        self.bodySize = 0
+        self.contentLength = 0
+        self.chunked = false
+        self.chunkRemaining = 0
+        self.chunks = 0
+        self.headerBytes = 0
+        self.headerCount = 0
+        self.expectContinue = false
+        self.continueNotified = false
+        self.currentRequest = nil
+        return self:event("end", request!, "", false, nil)
+      else
+        return self:failEvent(500, "parser in unknown state")
+      end
+    end
+  end,
+
+  --- Parses only the request line and headers, leaving the parser positioned
+  --- at the body. A non-streaming caller can then use next() to collect the
+  --- whole body; a streaming caller uses nextEvent().
+  peekHeaders(): ParseOutcome
+    while true do
+      local ev: ParseEvent = self:nextEvent()
+      if ev.kind == "headers" then
+        return { request = ev.request, error = nil, needMore = false, expectContinue = false }
+      elseif ev.kind == "continue" then
+        return { request = nil, error = nil, needMore = true, expectContinue = true }
+      elseif ev.kind == "needMore" then
+        return { request = nil, error = nil, needMore = true, expectContinue = false }
+      elseif ev.kind == "error" then
+        return { request = nil, error = ev.error, needMore = false, expectContinue = false }
+      else
+        return {
+          request = nil,
+          error = { status = 400, message = "request ended before headers" },
+          needMore = false,
+          expectContinue = false,
+        }
+      end
+    end
+  end,
+
   finishHeaders(): ParseOutcome | nil
     local hostValues: string[] = self.headers:getAll("Host")
     if #hostValues > 1 then
@@ -550,6 +927,7 @@ class HttpRequestParser implements HttpRequestParserApi {
     self.headerCount = 0
     self.expectContinue = false
     self.continueNotified = false
+    self.currentRequest = nil
     return { request = req, error = nil, needMore = false, expectContinue = false }
   end,
 }

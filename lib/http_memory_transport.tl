@@ -45,6 +45,22 @@ class MemoryConnection implements HttpConnectionApi {
     return text
   end,
 
+  needsWrite(): boolean
+    return false
+  end,
+
+  needsHandshake(): boolean
+    return false
+  end,
+
+  poll(): boolean
+    return false
+  end,
+
+  protocol(): string
+    return ""
+  end,
+
   isReadable(): boolean
     if self.ipos <= #self.input then
       return true

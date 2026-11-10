@@ -1,5 +1,7 @@
 import T from "tlua_test"
 import http from "../lib/http"
+import ws from "../lib/http_websocket"
+import literal from "../lib/http_literal"
 
 local socket: any = nil
 local loadedSocket: any = nil
@@ -141,4 +143,98 @@ return {
     T.ok(fixture.server:address().port > 0, "server remains healthy")
     close(fixture)
   end,
+  ["real TCP WebSocket echo"] = function(): void
+    local transport = http.SocketTransport.new()
+    local router = http.HttpRouter.new()
+    router:get("/ws", function(ctx: HttpContextApi): void
+      ctx:websocket({
+        onText = function(socket: any, text: string): void
+          socket:sendText("real:" .. text)
+        end,
+      })
+    end)
+    local server = http.HttpServer.new(router, transport, { idleTimeout = 10 })
+    server:listen("127.0.0.1", 0)
+    local address = server:address()
+    local client, err = socket.connect("127.0.0.1", address.port)
+    if client == nil then error("connect failed: " .. tostring(err)) end
+    client:settimeout(0)
+    local fixture: TcpFixture = { server = server, client = client }
+    local function receiveUntil(predicate: (buffer: string) -> boolean, initial: string): string
+      local buffer: string = initial
+      for _: integer = 1, 4000 do
+        fixture.server:step(0.002)
+        local data, rerr, partial = fixture.client:receive(65536)
+        if data ~= nil then
+          buffer = buffer .. tostring(data)
+        elseif partial ~= nil and #tostring(partial) > 0 then
+          buffer = buffer .. tostring(partial)
+        end
+        if predicate(buffer) then return buffer end
+        if rerr == "closed" then return buffer end
+      end
+      error("WebSocket pump timed out")
+    end
+    send(
+      fixture,
+      "GET /ws HTTP/1.1\r\nHost: tcp\r\n"
+        .. "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+        .. "Sec-WebSocket-Version: 13\r\n"
+        .. "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+    )
+    local handshake = receiveUntil(function(buffer: string): boolean
+      return literal.find(buffer, "\r\n\r\n", 1) ~= nil
+    end, "")
+    T.ok(string.find(handshake, "HTTP/1.1 101", 1, true) ~= nil, "101")
+    T.ok(string.find(handshake, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", 1, true) ~= nil, "accept")
+    local separator: integer = literal.find(handshake, "\r\n\r\n", 1)!
+    local streamBytes: string = string.sub(handshake, separator + 4)
+
+    local mask: string = "\1\2\3\4"
+    send(fixture, ws.encodeFrame(ws.OP_TEXT, "hi", true, mask))
+    local afterEcho = receiveUntil(function(buffer: string): boolean
+      return string.find(buffer, "real:hi", 1, true) ~= nil
+    end, streamBytes)
+    T.ok(string.find(afterEcho, "real:hi", 1, true) ~= nil, "echo")
+
+    send(fixture, ws.encodeFrame(ws.OP_CLOSE, string.char(3, 232), true, mask))
+    for _: integer = 1, 100 do
+      fixture.server:step(0.002)
+    end
+    T.ok(client ~= nil, "socket alive")
+    close(fixture)
+  end,
+
+  ["real TCP streaming request body"] = function(): void
+    local transport = http.SocketTransport.new()
+    local router = http.HttpRouter.new()
+    router:stream("POST", "/stream", function(ctx: HttpContextApi): void
+      local total: integer = 0
+      local chunks: integer = 0
+      while true do
+        local chunk: string | nil = ctx:readBody()
+        if chunk == nil then break end
+        total = total + #chunk!
+        chunks = chunks + 1
+      end
+      ctx:send(tostring(total) .. ":" .. tostring(chunks), "text/plain")
+    end)
+    local server = http.HttpServer.new(router, transport, { idleTimeout = 10, maxBody = 200000 })
+    server:listen("127.0.0.1", 0)
+    local address = server:address()
+    local client, err = socket.connect("127.0.0.1", address.port)
+    if client == nil then error("connect failed: " .. tostring(err)) end
+    client:settimeout(0)
+    local fixture: TcpFixture = { server = server, client = client }
+    local body: string = string.rep("s", 70000)
+    send(fixture, "POST /stream HTTP/1.1\r\nHost: tcp\r\nContent-Length: 70000\r\n\r\n")
+    for _: integer = 1, 30 do fixture.server:step(0.001) end
+    send(fixture, string.sub(body, 1, 30000))
+    for _: integer = 1, 30 do fixture.server:step(0.001) end
+    send(fixture, string.sub(body, 30001))
+    local response = pump(fixture, 1)
+    T.ok(string.find(response, "70000:", 1, true) ~= nil, "streamed total")
+    close(fixture)
+  end,
+
 }

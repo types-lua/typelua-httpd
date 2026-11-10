@@ -10,11 +10,34 @@
     <main>
       <h1>Static file serving</h1>
       <p>This page is served by <code>HttpStatic</code> with ETags, ranges and traversal protection.</p>
+      <h2>WebSocket demo</h2>
+      <p>
+        <input id="ws-message" value="hello over websocket" size="32">
+        <button id="ws-send">send</button>
+      </p>
+      <pre id="ws-log"></pre>
+
+      <h2>Static files</h2>
       <ul>
         <li><a href="/static/hello.txt">hello.txt</a></li>
         <li><a href="/static/nested/data.json">nested/data.json</a></li>
         <li><a href="/">back to the demo</a></li>
       </ul>
     </main>
+    <script>
+      const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+      const socket = new WebSocket(`${scheme}://${location.host}/ws`);
+      const log = document.getElementById('ws-log');
+      const input = document.getElementById('ws-message');
+      socket.addEventListener('message', (event) => {
+        log.textContent += `server: ${event.data}\n`;
+      });
+      document.getElementById('ws-send').addEventListener('click', () => {
+        log.textContent += `client: ${input.value}\n`;
+        socket.send(input.value);
+      });
+      socket.addEventListener('open', () => { log.textContent += 'connected\n'; });
+      socket.addEventListener('close', () => { log.textContent += 'closed\n'; });
+    </script>
   </body>
 </html>
