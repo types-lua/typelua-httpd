@@ -10,14 +10,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
-        with:
-          go-version: stable
-
       - name: Install TypeLua
         run: |
-          go install github.com/typelua/typelua/cmd/tlua@v0.9.9
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          curl -fsSL -o /tmp/tlua \
+            https://github.com/types-lua/TypeLua/releases/download/v0.9.9/tlua-linux-amd64
+          chmod +x /tmp/tlua
+          sudo mv /tmp/tlua /usr/local/bin/tlua
+          tlua version
 
       - name: Install Lua runtimes and LuaSocket
         run: |
