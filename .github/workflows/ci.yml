@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Install TypeLua
+        run: |
+          go install github.com/typelua/typelua/cmd/tlua@v0.9.9
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Install Lua runtimes and LuaSocket
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lua5.4 luajit lua-socket
+
+      - name: Type-check
+        run: tlua check
+
+      - name: Embedded runtime tests
+        run: tlua test
+
+      - name: Lua 5.4 + real LuaSocket
+        run: tlua test --lua lua5.4
+
+      - name: LuaJIT / Lua 5.1 target
+        run: tlua test --lua luajit --target 5.1
+
+      - name: Build all modules
+        run: tlua build

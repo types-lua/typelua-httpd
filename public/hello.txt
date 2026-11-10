@@ -1,0 +1,6 @@
+Hello from a real static file.
+
+Try:
+  curl -i http://127.0.0.1:8080/static/hello.txt
+  curl -i -H 'Range: bytes=0-4' http://127.0.0.1:8080/static/hello.txt
+  curl -i -H 'If-None-Match: "..."' http://127.0.0.1:8080/static/hello.txt
