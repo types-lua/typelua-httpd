@@ -1,6 +1,8 @@
 --- Smallest useful real HTTP server.
 ---
----   tlua run --lua lua5.4 examples/hello.tl
+--- Build the project, then run from the emitted tree so `lib.http` resolves:
+---   tlua build
+---   (cd dist && lua5.4 examples/hello.lua)
 ---   curl -i http://127.0.0.1:8090/
 
 import http from "../lib/http"

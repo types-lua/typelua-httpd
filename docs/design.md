@@ -180,10 +180,13 @@ become `..` later. The root itself is trusted configuration; symlinks inside it 
 followed with an additional containment check, so do not expose an attacker-writable
 tree.
 
-Files are read with `seek("end")` to distinguish directories (where `io.open` succeeds on
-Linux) from empty regular files, and to enforce `maxBytes` before reading. Content is
-buffered whole. ETags are two independent 31-bit rolling hashes (62 bits of tag).
-Conditional requests use weak comparison; `If-Range` requires the exact strong tag.
+Files are probed with `read(0)` before trusting `seek("end")`; directory sizes are
+filesystem-specific (some report zero, some report more than the cap), while `io.open`
+accepts directories on Linux. A zero-byte regular file is still served as empty. The size
+probe enforces `maxBytes` before reading, and the read is capped at `maxBytes + 1` to
+catch files that grow between the probe and the read. Content is buffered whole. ETags
+are two independent 31-bit rolling hashes (62 bits of tag). Conditional requests use weak
+comparison; `If-Range` requires the exact strong tag.
 
 Only a single byte range is implemented. Multiple or malformed ranges are ignored and
 the full representation is sent, which RFC 7233 permits. An unsatisfiable range sends

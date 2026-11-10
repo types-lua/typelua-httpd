@@ -5,6 +5,8 @@ return {
   ["status reasons and body rules"] = function(): void
     T.eq(http.status.reason(200), "OK", "200")
     T.eq(http.status.reason(418), "I'm a teapot", "418")
+    T.eq(http.status.reason(416), "Range Not Satisfiable", "416")
+    T.eq(http.status.reason(205), "Reset Content", "205")
     T.eq(http.status.reason(299), "Unknown", "unknown")
     T.ok(http.status.isBodyless(204), "204")
     T.ok(http.status.isBodyless(205), "205")

@@ -70,7 +70,13 @@ curl -i http://127.0.0.1:8080/static/
 curl -i -H 'Range: bytes=0-4' http://127.0.0.1:8080/static/hello.txt
 ```
 
-The smallest complete program is [`examples/hello.tl`](examples/hello.tl).
+The smallest complete program is [`examples/hello.tl`](examples/hello.tl). It lives in a
+subdirectory, so run it from the emitted tree:
+
+```bash
+tlua build
+(cd dist && lua5.4 examples/hello.lua)
+```
 
 ## Library tour
 

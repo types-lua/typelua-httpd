@@ -166,6 +166,10 @@ return {
     T.eq(e.status, 416, "out of range")
     T.eq(e.headers:get("Content-Range"), "bytes */10", "416 content-range")
     T.eq(e.body, "", "416 body")
+    T.ok(
+      string.find(wire(e, "GET"), "HTTP/1.1 416 Range Not Satisfiable", 1, true) ~= nil,
+      "416 reason phrase"
+    )
 
     local f = serve(static, "GET", "/range.txt", { Range = "bytes=4-2" })
     T.eq(f.status, 416, "inverted range")
