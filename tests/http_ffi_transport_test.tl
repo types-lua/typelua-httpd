@@ -310,6 +310,15 @@ end
 
 
 return {
+  ["FFI selector sleeps when no descriptors are active"] = function(): void
+    local transport = http.FfiSocketTransport.new()
+    local selector = transport:selector()
+    local started: number = transport:now()
+    selector:select({}, {}, 0.1)
+    local elapsed: number = transport:now() - started
+    T.ok(elapsed >= 0.05, "idle select slept for " .. tostring(elapsed) .. "s")
+  end,
+
   ["FFI TCP keep-alive, POST and WebSocket"] = function(): void
     local f = plainFixture()
     local port: integer = f.server:address().port

@@ -719,7 +719,17 @@ class FfiSelector implements HttpSelectorApi {
     for i: integer = 1, #readers do add(readers[i], POLLIN) end
     for i: integer = 1, #writers do add(writers[i], POLLOUT) end
 
+    local milliseconds: integer = math.floor(timeoutSeconds * 1000)
+    if milliseconds < 0 then milliseconds = 0 end
+    if milliseconds > 60000 then milliseconds = 60000 end
+
+    -- An idle server has no descriptors to watch. poll(NULL, 0, timeout)
+    -- still sleeps; returning immediately would turn serve() into a busy loop
+    -- and pin one CPU core per server.
     if #order == 0 then
+      if milliseconds > 0 then
+        self.C.poll(nil, 0, milliseconds)
+      end
       return { readable = {}, writable = {}, err = nil }
     end
 
@@ -729,9 +739,6 @@ class FfiSelector implements HttpSelectorApi {
       fds[i - 1].events = events[order[i]]
       fds[i - 1].revents = 0
     end
-    local milliseconds: integer = math.floor(timeoutSeconds * 1000)
-    if milliseconds < 0 then milliseconds = 0 end
-    if milliseconds > 60000 then milliseconds = 60000 end
     local ready: any = self.C.poll(fds, #order, milliseconds)
     if ready < 0 then
       local errno: integer = self.ffi.errno() as integer
