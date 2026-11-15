@@ -5,7 +5,8 @@ A strict, transport-independent HTTP server library written in
 
 - HTTP/1.1 with keep-alive, pipelining, chunked bodies and 100-continue.
 - HTTP/2 over TLS ALPN (`h2`) and cleartext h2c prior knowledge.
-- TLS through LuaSec, including non-blocking handshakes and ALPN.
+- TLS through LuaSec or the optional LuaJIT/OpenSSL FFI adapter, including
+  non-blocking handshakes and ALPN.
 - RFC 6455 WebSocket upgrade, framing, ping/pong, fragmentation and limits.
 - Incremental `multipart/form-data` parsing with a pull reader.
 - Streaming request bodies with a coroutine-friendly `ctx:readBody()`.
@@ -36,8 +37,9 @@ negotiation happens before request parsing, so handlers stay protocol-neutral.
   malformed chunks and invalid HTTP/2 sequences before handlers run.
 - **Deterministic tests.** The entire server loop runs over a memory transport;
   real socket, TLS and ALPN paths are integration-tested separately.
-- **No mandatory C modules for the core.** Types erase to ordinary Lua. LuaSocket
-  is needed for real TCP, LuaSec additionally for TLS.
+- **No mandatory C modules for the core.** Types erase to ordinary Lua. The
+  core never loads LuaSocket or LuaSec; those adapters are optional, as is the
+  LuaJIT FFI adapter for environments that want neither.
 
 ## Requirements
 
@@ -45,9 +47,10 @@ negotiation happens before request parsing, so handlers stay protocol-neutral.
 | --- | --- |
 | TypeLua | `tlua` v0.9.9 or newer |
 | Lua | 5.4 (default), or LuaJIT / Lua 5.1 with `tlua --target 5.1` |
-| Real TCP | [LuaSocket](https://lunarmodules.github.io/luasocket/) (`lua-socket`) |
-| TLS / HTTP/2 over TLS | [LuaSec](https://github.com/lunarmodules/luasec) (`lua-sec`) |
-| Tests | `tlua`; LuaSocket/LuaSec enable the real-network cases |
+| Real TCP (default adapter) | [LuaSocket](https://lunarmodules.github.io/luasocket/) (`lua-socket`) |
+| TLS / HTTP/2 over TLS (default adapter) | [LuaSec](https://github.com/lunarmodules/luasec) (`lua-sec`) |
+| Real TCP/TLS without those modules | LuaJIT + the optional FFI adapter, or a custom transport |
+| Tests | `tlua`; LuaSocket/LuaSec enable the real-network cases; LuaJIT also covers the FFI adapters |
 
 ```bash
 sudo apt-get install lua-socket lua-sec
@@ -96,10 +99,167 @@ tlua build
 (cd dist && lua5.4 examples/hello.lua)
 ```
 
+## Use as a dependency
+
+The repository is also a TypeLua package. The package path is the Git path:
+
+```toml
+# tlua.toml
+[package]
+name = "my-service"
+version = "v0.1.0"
+
+[dependencies]
+"github.com/types-lua/typelua-httpd" = "^v0.1.0"
+```
+
+```bash
+tlua mod get
+tlua mod vendor        # optional, but recommended for reproducible/offline builds
+```
+
+Add the package's ambient contracts to your project so handler annotations such
+as `HttpContextApi` resolve:
+
+```json
+{
+  "compilerOptions": {
+    "typeRoots": [
+      "types",
+      "tlua_modules/github.com/types-lua/typelua-httpd/types"
+    ]
+  }
+}
+```
+
+Then import the package root:
+
+```tl
+import http from "github.com/types-lua/typelua-httpd"
+
+local router = http.HttpRouter.new()
+router:get("/", function(ctx: HttpContextApi): void
+  ctx:text("hello from my service\n")
+end)
+
+local server = http.HttpServer.new(router, http.SocketTransport.new(), {})
+server:listen("127.0.0.1", 8080)
+server:serve()
+```
+
+```bash
+tlua check
+tlua build
+lua5.4 dist/main.lua
+```
+
+If you do not use the package manager, copy `lib/`, `types/`, `init.tl`,
+`core.tl` and `adapters/{socket,tls,ffi}.tl` under
+`tlua_modules/github.com/types-lua/typelua-httpd/` (or use a Git submodule) and
+keep the same import path. Avoid absolute filesystem imports: they do not
+survive `tlua build`.
+
+`main.tl`, `examples/` and `docs/` are repository material, not part of the
+required runtime package surface.
+
+## Without LuaSocket / LuaSec
+
+The protocol core itself has no C-module dependency:
+
+```tl
+import http from "github.com/types-lua/typelua-httpd/core"
+```
+
+`core` loads no `socket`, `ssl` or `ffi` module. It gives you the parser,
+router, server state machine, static files, WebSocket, multipart and the
+memory transport. Real network I/O is injected through `HttpTransportApi`:
+
+| Option | Lua 5.4 | LuaJIT | Notes |
+| --- | --- | --- | --- |
+| `core` + your transport | yes | yes | No LuaSocket/LuaSec/FFI; I/O owned by your runtime |
+| `core` + `MemoryTransport` | yes | yes | Tests, embedded dispatch, protocol fuzzing |
+| `ffi` adapter | no | yes | POSIX/Linux, IPv4, system OpenSSL for TLS |
+| `socket` / `tls` adapters | yes | yes | Existing LuaSocket/LuaSec path, unchanged |
+
+### LuaJIT FFI transport
+
+On LuaJIT the optional `ffi` entrypoint provides real TCP/TLS without loading
+LuaSocket or LuaSec:
+
+```tl
+import http from "github.com/types-lua/typelua-httpd/core"
+import ffiTransport from "github.com/types-lua/typelua-httpd/adapters/ffi"
+
+local server = http.HttpServer.new(
+  router,
+  ffiTransport.FfiSocketTransport.new(),
+  {}
+)
+```
+
+TLS (OpenSSL libssl/libcrypto) uses the same transport contract:
+
+```tl
+local transport = ffiTransport.FfiTlsTransport.new({
+  certificate = "cert.pem",
+  key = "key.pem",
+  alpn = { "h2", "http/1.1" },
+})
+```
+
+Run the emitted program with `luajit` (not `lua5.4`). No LuaSocket/LuaSec C
+modules are required; the process links the system OpenSSL libraries.
+
+Constraints: Linux/POSIX syscalls (`accept4`, `poll`), IPv4 only, unencrypted
+PEM private keys, and no client-certificate verification. TLS policy still
+comes from OpenSSL. If you need Lua 5.4 or a platform without FFI, use
+LuaSocket/LuaSec, a custom transport, or terminate TLS in a reverse proxy.
+
+### Custom transport
+
+`HttpServer` only needs this small port. Implement it over your own event loop
+or socket library and the entire router/serving stack works unchanged:
+
+```tl
+interface HttpTransportApi {
+  listen(host: string, port: integer, backlog: integer): ListenResult,
+  selector(): HttpSelectorApi,
+  now(): number,
+}
+
+interface HttpConnectionApi {
+  id(): string,
+  readAvailable(maxBytes: integer): ReadResult,
+  writeSome(data: string): WriteResult,
+  close(): void,
+  remoteAddress(): string,
+  isReadable(): boolean,
+  needsWrite(): boolean,
+  needsHandshake(): boolean,
+  poll(): boolean,
+  protocol(): string,          -- "" | "h2" | "http/1.1"
+}
+```
+
+See [`docs/transports.md`](docs/transports.md) for the result records and a
+skeleton adapter. `protocol()` is where an external TLS layer reports ALPN;
+`poll()` returns true only when the transport can buffer decrypted bytes that
+`select()` cannot see (for example a TLS library).
+
+The original adapters remain first-class:
+
+```tl
+import http from "github.com/types-lua/typelua-httpd"       -- full facade
+import socketTransport from "github.com/types-lua/typelua-httpd/adapters/socket"
+import tlsTransport from "github.com/types-lua/typelua-httpd/adapters/tls"
+```
+
 ## Library tour
 
 | Module | Purpose |
 | --- | --- |
+| `lib/http_core.tl` | Dependency-free facade: no socket/ssl/ffi imports |
+| `lib/http.tl` | Full facade with the bundled Socket/TLS/FFI adapters |
 | `lib/http_parser.tl` | Incremental HTTP/1.1 parser plus event/streaming API |
 | `lib/http_server.tl` | Protocol sniffing, HTTP/1.1 state machine, timeouts, backpressure |
 | `lib/http_router.tl` | Ordered routes, params, wildcard, middleware, `stream` routes |
@@ -113,6 +273,8 @@ tlua build
 | `lib/http_multipart.tl` | Incremental multipart parser and pull reader |
 | `lib/http_memory_transport.tl` | Scriptable transport used by tests |
 | `lib/http_socket_transport.tl` | LuaSocket TCP adapter |
+| `lib/http_ffi_transport.tl` | LuaJIT FFI TCP/TLS adapter (optional, Linux/POSIX) |
+| `init.tl`, `core.tl`, `adapters/{socket,tls,ffi}.tl` | Package entrypoints for external projects |
 | `types/http.d.tl` | Ambient contracts shared by all modules |
 
 ### Routing

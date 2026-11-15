@@ -8,12 +8,20 @@
 import socketTransport from "./http_socket_transport"
 
 local socketModule: any = nil
-local socketOk, loadedSocket = pcall(require, "socket")
-if socketOk then socketModule = loadedSocket end
+local socketOk: boolean = false
+local loadedSocket: any = nil
+socketOk, loadedSocket = pcall(require, "socket")
+if socketOk and loadedSocket ~= nil and type(loadedSocket.bind) == "function" then
+  socketModule = loadedSocket
+end
 
 local sslModule: any = nil
-local sslOk, loadedSsl = pcall(require, "ssl")
-if sslOk then sslModule = loadedSsl end
+local sslOk: boolean = false
+local loadedSsl: any = nil
+sslOk, loadedSsl = pcall(require, "ssl")
+if sslOk and loadedSsl ~= nil and type(loadedSsl.wrap) == "function" then
+  sslModule = loadedSsl
+end
 
 type TlsOptions = {
   certificate: string,

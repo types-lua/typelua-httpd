@@ -174,7 +174,7 @@ declare type ParserOptions = {
 }
 
 -- ---------------------------------------------------------------------------
--- Transport ports (memory for tests, LuaSocket for real TCP)
+-- Transport ports (memory for tests; LuaSocket/LuaSec or LuaJIT FFI for real I/O)
 -- ---------------------------------------------------------------------------
 
 declare type ReadResult = {

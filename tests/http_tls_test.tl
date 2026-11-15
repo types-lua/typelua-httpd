@@ -14,10 +14,14 @@ local loadedSocket: any = nil
 local loadedSsl: any = nil
 socketOk, loadedSocket = pcall(require, "socket")
 sslOk, loadedSsl = pcall(require, "ssl")
-if socketOk then socket = loadedSocket end
-if sslOk then ssl = loadedSsl end
+if socketOk and loadedSocket ~= nil and type(loadedSocket.bind) == "function" then
+  socket = loadedSocket
+end
+if sslOk and loadedSsl ~= nil and type(loadedSsl.wrap) == "function" then
+  ssl = loadedSsl
+end
 
-if not socketOk or not sslOk then
+if socket == nil or ssl == nil then
   return {
     ["TLS transport (skipped: LuaSocket/LuaSec unavailable)"] = function(): void
       T.ok(true, "install lua-socket and lua-sec to run TLS tests")

@@ -7,10 +7,10 @@ local socket: any = nil
 local loadedSocket: any = nil
 local socketOk: boolean = false
 socketOk, loadedSocket = pcall(require, "socket")
-if socketOk then
+if socketOk and loadedSocket ~= nil and type(loadedSocket.bind) == "function" then
   socket = loadedSocket
 end
-if not socketOk then
+if socket == nil then
   return {
     ["LuaSocket transport (skipped: socket module unavailable)"] = function(): void
       T.ok(true, "memory transport tests cover the protocol core")

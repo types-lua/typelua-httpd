@@ -26,6 +26,9 @@ jobs:
       - name: Type-check
         run: tlua check
 
+      - name: Package dependency smoke test
+        run: ./scripts/check-package.sh
+
       - name: Embedded runtime tests
         run: tlua test
 

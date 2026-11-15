@@ -29,7 +29,7 @@ mTLS termination, compression and streaming responses.
           │ parser/state │ frames/HPACK/flow │
           ├──────────────┴───────────────────┤
           │ HttpTransportApi                 │
-          │ memory · LuaSocket · LuaSec TLS  │
+          │ memory · LuaSocket/LuaSec · FFI  │
           └──────────────────────────────────┘
 ```
 
@@ -37,6 +37,12 @@ mTLS termination, compression and streaming responses.
 non-blocking `readAvailable`, `writeSome`, `close`, ALPN protocol, handshake and
 polling hints. The memory transport returns immediately and uses a manual clock,
 so timeout tests are deterministic.
+
+The public surface is split into `core` (no C modules), optional
+`socket`/`tls` adapters (LuaSocket/LuaSec), and an optional `ffi` adapter
+(LuaJIT + system libc/OpenSSL). `lib/http.tl` is the full facade; package
+entrypoints at the repository root expose the same modules for external
+projects. The core performs no `require` of any adapter at load time.
 
 ## Connection lifecycle
 
@@ -161,6 +167,8 @@ interoperability tests exercise Huffman request blocks and dynamic tables.
 
 ## TLS
 
+### LuaSec path
+
 LuaSec wraps accepted sockets with a non-blocking SSL object:
 
 - `dohandshake()` returns `wantread`/`wantwrite`; the connection records write
@@ -174,6 +182,24 @@ LuaSec wraps accepted sockets with a non-blocking SSL object:
   rest.
 - Certificate/key files are checked at construction. There is no client cert
   verification, OCSP or SNI certificate switching.
+
+### LuaJIT FFI path
+
+`http_ffi_transport.tl` implements the same connection/listener/selector ports
+with raw POSIX calls and OpenSSL:
+
+- `socket`/`bind`/`listen`/`accept4` with non-blocking descriptors; `poll`
+  multiplexes `POLLIN`/`POLLOUT` and surfaces `POLLERR`/`POLLHUP` as readable.
+- `SSL_CTX` loads the certificate chain and private key, disables client
+  verification, enables partial writes and installs an ALPN select callback.
+- `SSL_accept` is driven by `wantread`/`wantwrite`; `SSL_get0_alpn_selected`
+  feeds `protocol()`. `SSL_read` drains buffered plaintext (capped per event)
+  and `poll()` forces short server turns because `select` cannot see OpenSSL's
+  internal buffer.
+- The FFI module is loaded only when an FFI transport is constructed. It does
+  not affect Lua 5.4 builds or the LuaSocket/LuaSec adapters.
+- Limits: Linux/POSIX syscalls, IPv4, unencrypted PEM keys, OpenSSL shared
+  library. This is an adapter choice, not a change to the protocol core.
 
 ## WebSocket
 
@@ -238,5 +264,10 @@ Defaults are listed in the README. The important invariants are:
 - Multipart: boundary splits at every byte, binary payloads, filename*, limits.
 - Real TCP/TLS: LuaSocket/LuaSec clients, ALPN h1/h2, HTTP/2 GET/POST/streaming,
   WebSocket echo and streaming uploads.
+- FFI adapter on LuaJIT: raw FFI client keep-alive/POST/WebSocket/h2c, plus
+  FFI TLS with LuaSec clients selecting `http/1.1` and `h2`.
+- Package smoke test: a temporary external project depends on the package by
+  path, runs `mod get`/`mod vendor`, type-checks an import of the root, `core`
+  and `ffi` entrypoints, and asserts that `core` loads no socket/ssl/ffi module.
 - External curl/nghttp2 checks are used during development for h2c, TLS ALPN,
   large headers and 50 KB streaming uploads.

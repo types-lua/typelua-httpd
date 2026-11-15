@@ -5,8 +5,12 @@
 --- missing. All sockets are non-blocking; multiplexing is done by `select`.
 
 local socketModule: any = nil
-local loadOk, loaded = pcall(require, "socket")
-if loadOk then
+local loadOk: boolean = false
+local loaded: any = nil
+loadOk, loaded = pcall(require, "socket")
+-- Some embedded runtimes expose a placeholder `socket` table. Treat it as
+-- missing unless the functions this adapter actually needs are present.
+if loadOk and loaded ~= nil and type(loaded.bind) == "function" then
   socketModule = loaded
 end
 
@@ -156,7 +160,7 @@ class SocketSelector implements HttpSelectorApi {
       byId[writers[i]:id()] = writers[i]
       ws[#ws + 1] = c:raw()
     end
-    if socketModule == nil then
+    if socketModule == nil or type(socketModule.select) ~= "function" then
       return { readable = {}, writable = {}, err = "LuaSocket is not installed" }
     end
     local selectOk: boolean = false
