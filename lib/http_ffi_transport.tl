@@ -11,7 +11,7 @@
 
 local ffiOk: boolean = false
 local ffiModule: any = nil
-ffiOk, ffiModule = pcall(require, "ffi")
+local ffiProbed: boolean = false
 
 local cdefsDone: boolean = false
 
@@ -120,6 +120,10 @@ void ERR_clear_error(void);
 ]]
 
 local function ensureFfi(): any
+  if not ffiProbed then
+    ffiProbed = true
+    ffiOk, ffiModule = pcall(require, "ffi")
+  end
   if not ffiOk or ffiModule == nil then
     error("LuaJIT FFI is required for the FFI transport; use LuaJIT or a custom HttpTransportApi")
   end
