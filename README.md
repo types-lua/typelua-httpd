@@ -115,7 +115,7 @@ version = "v0.1.0"
 
 ```bash
 tlua mod get
-tlua mod vendor        # optional, but recommended for reproducible/offline builds
+tlua mod vendor        # required for the typeRoots path below, and for offline builds
 ```
 
 Add the package's ambient contracts to your project so handler annotations such
@@ -156,8 +156,9 @@ lua5.4 dist/main.lua
 If you do not use the package manager, copy `lib/`, `types/`, `init.tl`,
 `core.tl` and `adapters/{socket,tls,ffi}.tl` under
 `tlua_modules/github.com/types-lua/typelua-httpd/` (or use a Git submodule) and
-keep the same import path. Avoid absolute filesystem imports: they do not
-survive `tlua build`.
+keep the same import path. Alternatively copy just `types/http.d.tl` into your
+project's `types/` directory and omit the package path from `typeRoots`. Avoid
+absolute filesystem imports: they do not survive `tlua build`.
 
 `main.tl`, `examples/` and `docs/` are repository material, not part of the
 required runtime package surface.
@@ -460,6 +461,7 @@ tlua check
 tlua test                                  # embedded golua (C modules skip)
 tlua test --lua lua5.4                     # TCP, TLS, ALPN, WebSocket, HTTP/2
 tlua test --lua luajit --target 5.1        # LuaJIT / Lua 5.1 compatibility
+./scripts/check-package.sh                 # external-project install smoke test
 ```
 
 The suite covers headers, URL/path safety, crypto vectors, HPACK RFC vectors,
@@ -467,7 +469,8 @@ HTTP/2 frames and streams, parser framing and every split point, response
 serialization, router semantics, static files/ranges/ETags, multipart boundaries,
 server integration (keep-alive, pipelining, 100-continue, timeouts, limits,
 backpressure, streaming, h2c), TLS handshakes/ALPN, HTTP/2 over TLS, real TCP
-WebSocket echo and real TCP streaming uploads.
+WebSocket echo, real TCP streaming uploads, LuaJIT FFI TCP/TLS (including
+h2c, WebSocket and HTTP/2), and the external package install path.
 
 See [`docs/design.md`](docs/design.md) for the state machines and invariants.
 

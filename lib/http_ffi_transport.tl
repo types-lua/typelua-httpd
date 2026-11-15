@@ -142,6 +142,10 @@ local function isRetryable(code: integer): boolean
   return code == EAGAIN or code == EINTR
 end
 
+local function hasBit(value: integer, bit: integer): boolean
+  return math.floor(value / bit) % 2 == 1
+end
+
 local function tlsError(ffi: any, CR: any): string
   local parts: string[] = {}
   local guard: integer = 0
@@ -742,13 +746,17 @@ class FfiSelector implements HttpSelectorApi {
       local revents: integer = fds[i - 1].revents as integer
       if revents ~= 0 then
         local conn: HttpConnectionApi = byFd[order[i]]!
-        if revents % 2 == 1
-          or revents % 16 >= 8
-          or revents % 64 >= 32
+        if hasBit(revents, POLLIN)
+          or hasBit(revents, POLLERR)
+          or hasBit(revents, POLLHUP)
+          or hasBit(revents, POLLNVAL)
         then
           readable[#readable + 1] = conn
         end
-        if revents % 8 >= 4 or revents % 32 >= 16 then
+        if hasBit(revents, POLLOUT)
+          or hasBit(revents, POLLERR)
+          or hasBit(revents, POLLHUP)
+        then
           writable[#writable + 1] = conn
         end
       end

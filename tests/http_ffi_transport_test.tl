@@ -184,6 +184,17 @@ local function plainFixture(): any
   router:post("/echo", function(ctx: HttpContextApi): void
     ctx:text(ctx.req.body)
   end)
+  router:stream("POST", "/upload", function(ctx: HttpContextApi): void
+    local total: integer = 0
+    local chunks: integer = 0
+    while true do
+      local chunk: string | nil = ctx:readBody()
+      if chunk == nil then break end
+      total = total + #chunk!
+      chunks = chunks + 1
+    end
+    ctx:send(tostring(total) .. ":" .. tostring(chunks), "text/plain")
+  end)
   router:get("/ws", function(ctx: HttpContextApi): void
     ctx:websocket({
       onText = function(socket: any, text: string): void
@@ -317,6 +328,16 @@ return {
     end, 20000)
     T.ok(string.find(second, "hello", 1, true) ~= nil, "POST body")
 
+    local uploadBody: string = string.rep("u", 100000)
+    client:sendAll(
+      "POST /upload HTTP/1.1\r\nHost: ffi\r\nContent-Length: 100000\r\n\r\n"
+        .. uploadBody
+    )
+    local uploaded: string = client:readUntil(f.server, function(text: string): boolean
+      return statusCount(text) >= 3
+    end, 30000)
+    T.ok(string.find(uploaded, "100000:", 1, true) ~= nil, "streaming upload total")
+
     client:sendAll(
       "GET /ws HTTP/1.1\r\nHost: ffi\r\n"
         .. "Upgrade: websocket\r\nConnection: Upgrade\r\n"
@@ -347,6 +368,13 @@ return {
     router:get("/version", function(ctx: HttpContextApi): void
       ctx:text("version=" .. ctx.req.version)
     end)
+    router:get("/ws", function(ctx: HttpContextApi): void
+      ctx:websocket({
+        onText = function(socket: any, text: string): void
+          socket:sendText("ffi-tls:" .. text)
+        end,
+      })
+    end)
 
     local plainFixture = openTls(router, { "http/1.1" })
     T.eq(plainFixture.client:getalpn(), "http/1.1", "ALPN http/1.1")
@@ -356,6 +384,23 @@ return {
     end, 30000)
     T.ok(string.find(h1, "HTTP/1.1 200 OK", 1, true) ~= nil, "TLS H1 status")
     T.ok(string.find(h1, "ffi tls", 1, true) ~= nil, "TLS H1 body")
+
+    tlsSend(
+      plainFixture.client,
+      "GET /ws HTTP/1.1\r\nHost: ffi\r\n"
+        .. "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+        .. "Sec-WebSocket-Version: 13\r\n"
+        .. "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+    )
+    local wsHandshake: string = tlsPump(plainFixture, function(text: string): boolean
+      return string.find(text, "HTTP/1.1 101", 1, true) ~= nil
+    end, 30000)
+    T.ok(string.find(wsHandshake, "HTTP/1.1 101", 1, true) ~= nil, "TLS WS handshake")
+    tlsSend(plainFixture.client, ws.encodeFrame(ws.OP_TEXT, "hi", true, "\1\2\3\4"))
+    local wsEcho: string = tlsPump(plainFixture, function(text: string): boolean
+      return string.find(text, "ffi-tls:hi", 1, true) ~= nil
+    end, 30000)
+    T.ok(string.find(wsEcho, "ffi-tls:hi", 1, true) ~= nil, "TLS WS echo")
     pcall(function(): void plainFixture.client:close() end)
     plainFixture.server:close()
 
