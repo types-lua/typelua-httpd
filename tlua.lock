@@ -1,0 +1,6 @@
+# tlua lockfile (tlua.lock) - exact pins; edit via `tlua mod get`
+[[module]]
+path = "github.com/types-lua/typelua-stdlib"
+version = "v0.2.3"
+commit = "d6b5f96117d9b03e124016aafa771c7d12262450"
+direct = true

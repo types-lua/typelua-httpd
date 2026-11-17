@@ -50,6 +50,7 @@ negotiation happens before request parsing, so handlers stay protocol-neutral.
 | Real TCP (default adapter) | [LuaSocket](https://lunarmodules.github.io/luasocket/) (`lua-socket`) |
 | TLS / HTTP/2 over TLS (default adapter) | [LuaSec](https://github.com/lunarmodules/luasec) (`lua-sec`) |
 | Real TCP/TLS without those modules | LuaJIT + the optional FFI adapter, or a custom transport |
+| Package dependency | [typelua-stdlib](https://github.com/types-lua/typelua-stdlib) (public, fetched by `tlua mod get`) |
 | Tests | `tlua`; LuaSocket/LuaSec enable the real-network cases; LuaJIT also covers the FFI adapters |
 
 ```bash
@@ -101,7 +102,10 @@ tlua build
 
 ## Use as a dependency
 
-The repository is also a TypeLua package. The package path is the Git path:
+The repository is also a TypeLua package. It depends on the public
+[`typelua-stdlib`](https://github.com/types-lua/typelua-stdlib) for strict
+Base64/hex, SHA-1/SHA-256 and portable 32-bit operations. The dependency is
+resolved transitively. The package path is the Git path:
 
 ```toml
 # tlua.toml
@@ -155,8 +159,9 @@ lua5.4 dist/main.lua
 
 If you do not use the package manager, copy `lib/`, `types/`, `init.tl`,
 `core.tl` and `adapters/{socket,tls,ffi}.tl` under
-`tlua_modules/github.com/types-lua/typelua-httpd/` (or use a Git submodule) and
-keep the same import path. Alternatively copy just `types/http.d.tl` into your
+`tlua_modules/github.com/types-lua/typelua-httpd/` (or use a Git submodule),
+plus `typelua-stdlib` under `tlua_modules/github.com/types-lua/typelua-stdlib/`,
+and keep the same import paths. Alternatively copy just `types/http.d.tl` into your
 project's `types/` directory and omit the package path from `typeRoots`. Avoid
 absolute filesystem imports: they do not survive `tlua build`.
 

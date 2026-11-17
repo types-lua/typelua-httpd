@@ -23,6 +23,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y lua5.4 luajit lua-socket lua-sec
 
+      - name: Resolve TypeLua dependencies
+        run: |
+          tlua mod get
+          tlua mod vendor
+
       - name: Type-check
         run: tlua check
 

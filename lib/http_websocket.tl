@@ -7,7 +7,7 @@
 
 import base64 from "./http_base64"
 import sha1 from "./http_sha1"
-import bits from "./http_bits"
+import bits from "github.com/types-lua/typelua-stdlib/bitops"
 
 local GUID: string = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 

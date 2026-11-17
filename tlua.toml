@@ -1,3 +1,7 @@
+# tlua package manifest (tlua.toml)
 [package]
 name = "typelua-httpd"
 version = "v0.1.0"
+
+[dependencies]
+"github.com/types-lua/typelua-stdlib" = "^v0.2.3"

@@ -1,6 +1,11 @@
---- Literal substring search that works identically on PUC Lua and the
---- embedded golua runtime (which mishandles `string.find(..., plain=true)`
---- when init > 1). Patterns are escaped before searching.
+--- Literal substring helpers shared by the HTTP parsers.
+---
+--- The standard library's implementation is byte-oriented and avoids the
+--- embedded-golua `string.find(..., plain=true)` init-offset bug that this
+--- module originally worked around. `escapePattern` remains available for
+--- callers that need to build a Lua pattern from literal text.
+
+import strings from "github.com/types-lua/typelua-stdlib/strings"
 
 local MAGIC: map<string, boolean> = {
   ["%"] = true, ["^"] = true, ["$"] = true, ["("] = true, [")"] = true,
@@ -21,17 +26,11 @@ local function escapePattern(value: string): string
 end
 
 local function find(value: string, needle: string, init: integer): integer | nil
-  if needle == "" then
-    if init < 1 or init > #value + 1 then return nil end
-    return init
-  end
-  local pattern: string = escapePattern(needle)
-  local at: integer | nil = string.find(value, pattern, init)
-  return at
+  return strings.find(value, needle, init)
 end
 
 local function contains(value: string, needle: string): boolean
-  return find(value, needle, 1) ~= nil
+  return strings.contains(value, needle)
 end
 
 return {
